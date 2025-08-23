@@ -1,5 +1,6 @@
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
+import twilio.rest
 import os
 from openai import OpenAI
 
@@ -8,37 +9,100 @@ app = Flask(__name__)
 # Initialize OpenAI client with new API
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Initialize Twilio client for SMS
+twilio_client = twilio.rest.Client(
+    os.getenv("TWILIO_ACCOUNT_SID"),
+    os.getenv("TWILIO_AUTH_TOKEN")
+)
+
 # Store conversation states (in production, use Redis or database)
 conversations = {}
+
+# Your phone number to receive SMS summaries
+YOUR_PHONE_NUMBER = "+13234576314"  # Your Google Voice number
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")  # Your Twilio number
+
+# YOUR BUSINESS PRICING - Edit these as needed
+PRICING_INFO = """
+CURRENT PRICING (always mention free estimates available):
+
+PLUMBING:
+- Basic repairs (leaks, clogs): $150-250
+- Toilet/faucet replacement: $200-400
+- Water heater repair: $300-500
+- Major plumbing (repiping): $1000-3000
+
+ELECTRICAL:
+- Outlet/switch work: $150-300
+- Light fixture install: $100-250
+- Panel upgrades: $1200-2500
+- Whole house rewiring: $3000-8000
+
+HVAC:
+- AC tune-up: $150-200
+- Repair calls: $200-400
+- New AC unit: $3500-7000
+- Ductwork: $1500-4000
+
+HANDYMAN:
+- $85/hour (2 hour minimum)
+- Most small jobs: $200-500
+- Drywall repair: $150-300
+- Painting (per room): $300-800
+
+CLEANING:
+- Regular house cleaning: $120-250
+- Deep cleaning: $200-400
+- Move-in/out: $250-500
+
+LANDSCAPING:
+- Lawn maintenance: $50-100/visit
+- Tree trimming: $300-800
+- Landscape design: $800-2500
+- Irrigation install: $1500-4000
+"""
 
 @app.route("/voice", methods=["POST"])
 def voice():
     resp = VoiceResponse()
     
-    # Ring your cell via Google Voice for 6 seconds
-    dial = resp.dial(timeout=6)
+    # Ring your cell via Google Voice for 6 seconds - NO fallback yet
+    dial = resp.dial(timeout=6, action="/ai-pickup", method="POST")
     dial.number("+13234576314")  # Your Google Voice number forwarding to your cell
     
-    # Small pause before AI starts
-    resp.pause(length=1)
+    return Response(str(resp), mimetype="text/xml")
+
+@app.route("/ai-pickup", methods=["POST"])
+def ai_pickup():
+    """This only runs if YOU don't answer within 6 seconds"""
+    resp = VoiceResponse()
+    dial_status = request.form.get("DialCallStatus", "")
     
-    # Gather speech input from the caller if you don't answer
-    gather = resp.gather(
-        input="speech", 
-        timeout=4, 
-        action="/process",
-        speech_timeout="auto",
-        enhanced=True
-    )
-    
-    gather.say(
-        "Hi there! Sorry I missed your call. I'm here to help you with any home services you need. What can I assist you with today?",
-        voice="Polly.Joanna-Neural"
-    )
-    
-    # Fallback if no speech detected
-    resp.say("I didn't catch that. Please call back when you're ready to chat!", voice="Polly.Joanna-Neural")
-    resp.hangup()
+    # Only proceed if the call wasn't answered
+    if dial_status in ["no-answer", "busy", "failed"]:
+        # Small pause before AI starts
+        resp.pause(length=1)
+        
+        # Gather speech input from the caller
+        gather = resp.gather(
+            input="speech", 
+            timeout=4, 
+            action="/process",
+            speech_timeout="auto",
+            enhanced=True
+        )
+        
+        gather.say(
+            "Hey there! So sorry I missed your call - I was probably helping another customer. I'm here now though, and I'd love to help you out. What kind of home service are you looking for today?",
+            voice="Polly.Joanna-Neural"
+        )
+        
+        # Fallback if no speech detected
+        resp.say("Hmm, I didn't catch that. Feel free to call back when you're ready to chat!", voice="Polly.Joanna-Neural")
+        resp.hangup()
+    else:
+        # If you answered, just hang up the AI side
+        resp.hangup()
     
     return Response(str(resp), mimetype="text/xml")
 
@@ -46,11 +110,12 @@ def voice():
 def process():
     transcription = request.form.get("SpeechResult", "")
     call_sid = request.form.get("CallSid", "")
+    caller_number = request.form.get("From", "Unknown")
     
     resp = VoiceResponse()
     
     if not transcription:
-        resp.say("Sorry, I didn't catch that. Could you repeat what you need help with?", 
+        resp.say("Sorry, I couldn't quite catch that - maybe the connection cut out for a sec? What were you looking for help with?", 
                 voice="Polly.Joanna-Neural")
         
         # Give them another chance
@@ -61,39 +126,47 @@ def process():
             speech_timeout="auto",
             enhanced=True
         )
-        gather.say("I'm listening...", voice="Polly.Joanna-Neural")
+        gather.say("I'm all ears...", voice="Polly.Joanna-Neural")
         
         return Response(str(resp), mimetype="text/xml")
     
     try:
         # Get or create conversation history
         if call_sid not in conversations:
-            conversations[call_sid] = []
+            conversations[call_sid] = {"messages": [], "caller": caller_number}
         
-        conversations[call_sid].append({"role": "user", "content": transcription})
+        conversations[call_sid]["messages"].append({"role": "user", "content": transcription})
         
         # Create messages with conversation history
         messages = [
             {
                 "role": "system", 
-                "content": """You are Sarah, a friendly receptionist for a home services business. 
+                "content": f"""You are Sarah, a super friendly and conversational receptionist for a home services business. Talk like a real person - use casual language, contractions, and be genuinely helpful.
 
-Key guidelines:
-- Be conversational and warm, not robotic
-- Keep responses under 25 words for phone calls
-- Collect: name, service needed, preferred timing, budget if relevant
-- Services include: plumbing, electrical, HVAC, handyman, cleaning, landscaping
-- For pricing, give general ranges and mention we provide free estimates
-- If you need more info, ask one question at a time
-- Be helpful but don't make promises about availability
-- If they want to schedule, get their contact info and preferred times
+{PRICING_INFO}
 
-Remember: This is a phone conversation, so be natural and conversational!"""
+AVAILABILITY:
+- Monday-Friday: 8 AM - 6 PM
+- Saturday: 9 AM - 4 PM  
+- Sunday: Emergency only
+- We can usually get someone out within 24-48 hours
+- Emergency calls: same day or next morning
+
+CONVERSATION STYLE:
+- Sound like you're actually talking to someone, not reading a script
+- Use "um," "you know," and natural speech patterns occasionally
+- Keep responses under 30 words but be conversational
+- Ask follow-up questions naturally
+- Get their name early and use it
+- If they want to schedule, get name, phone, service, and preferred timing
+- Always mention we do free estimates
+
+Remember: You're having a real conversation with someone who called for help!"""
             }
         ]
         
         # Add conversation history (keep last 6 messages for context)
-        messages.extend(conversations[call_sid][-6:])
+        messages.extend(conversations[call_sid]["messages"][-6:])
         
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -103,7 +176,7 @@ Remember: This is a phone conversation, so be natural and conversational!"""
         )
         
         answer = response.choices[0].message.content
-        conversations[call_sid].append({"role": "assistant", "content": answer})
+        conversations[call_sid]["messages"].append({"role": "assistant", "content": answer})
         
         resp.say(answer, voice="Polly.Joanna-Neural")
         
@@ -116,7 +189,7 @@ Remember: This is a phone conversation, so be natural and conversational!"""
                 speech_timeout="auto",
                 enhanced=True
             )
-            gather.say("Anything else I can help you with?", voice="Polly.Joanna-Neural")
+            gather.say("Is there anything else I can help you with today?", voice="Polly.Joanna-Neural")
             
             # Fallback ending
             resp.say("Thanks for calling! Have a great day!", voice="Polly.Joanna-Neural")
@@ -125,9 +198,12 @@ Remember: This is a phone conversation, so be natural and conversational!"""
         
         resp.hangup()
         
+        # Send SMS summary after call ends
+        send_call_summary(call_sid, conversations.get(call_sid, {}))
+        
     except Exception as e:
         print(f"OpenAI error: {e}")
-        resp.say("I'm having a bit of trouble right now. Let me take your name and number so someone can call you back.", 
+        resp.say("No worries, I'm having a little tech hiccup on my end. Let me just grab your name and number real quick so someone can call you right back, okay?", 
                 voice="Polly.Joanna-Neural")
         
         # Record their info as backup
@@ -150,11 +226,62 @@ def handle_recording():
     print(f"Transcription: {transcription}")
     
     resp = VoiceResponse()
-    resp.say("Got it! Someone will call you back shortly. Thanks for calling!", 
+    resp.say("Perfect, got it! Someone's definitely gonna call you back today. Thanks so much for calling!", 
             voice="Polly.Joanna-Neural")
     resp.hangup()
     
     return Response(str(resp), mimetype="text/xml")
+
+def send_call_summary(call_sid, conversation_data):
+    """Send SMS summary of the call to your phone"""
+    try:
+        if not conversation_data or not conversation_data.get("messages") or len(conversation_data["messages"]) < 2:
+            return  # No meaningful conversation to summarize
+        
+        messages = conversation_data["messages"]
+        caller_number = conversation_data.get("caller", "Unknown")
+        
+        # Generate summary using AI
+        summary_prompt = """Create a SHORT business call summary (1-2 sentences max). Include:
+- Customer name if mentioned
+- Service needed
+- Key outcome (quote given, scheduled, needs callback, etc.)
+- Any urgency
+
+Keep it brief and business-focused.
+
+Conversation:
+"""
+        
+        for msg in messages:
+            summary_prompt += f"{msg['role'].title()}: {msg['content']}\n"
+        
+        summary_response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Create a brief, actionable call summary for a business owner. Focus on outcomes and next steps."},
+                {"role": "user", "content": summary_prompt}
+            ],
+            max_tokens=80,
+            temperature=0.3
+        )
+        
+        summary = summary_response.choices[0].message.content.strip()
+        
+        # Format SMS message
+        sms_body = f"📞 {summary}\nFrom: {caller_number}"
+        
+        # Send SMS
+        message = twilio_client.messages.create(
+            body=sms_body,
+            from_=TWILIO_PHONE_NUMBER,
+            to=YOUR_PHONE_NUMBER
+        )
+        
+        print(f"SMS sent: {message.sid}")
+        
+    except Exception as e:
+        print(f"Error sending SMS summary: {e}")
 
 def is_conversation_ending(response):
     """Check if the AI response indicates the conversation should end"""
@@ -180,7 +307,8 @@ def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "openai_key": "set" if os.getenv("OPENAI_API_KEY") else "missing"
+        "openai_key": "set" if os.getenv("OPENAI_API_KEY") else "missing",
+        "twilio_configured": "yes" if os.getenv("TWILIO_ACCOUNT_SID") else "no"
     }, 200
 
 # Clean up old conversations periodically (basic cleanup)
