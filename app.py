@@ -12,31 +12,45 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 def voice():
     resp = VoiceResponse()
 
-    # Ring your cell via Google Voice for 6 seconds
-    dial = resp.dial(timeout=6)
+    # Ring your cell via Google Voice for 10 seconds
+    dial = resp.dial(timeout=10)
     dial.number("+13234576314")  # Your Google Voice number forwarding to your cell
+    resp.pause(length=1)  # small pause before AI starts
 
-    # If not answered, AI takes over
+    # Gather speech input from the caller if you don't answer
     with resp.gather(input="speech", timeout=5, action="/process") as gather:
-        gather.say("Sorry we missed your call. Please tell me what service you need, and I’ll help you right away.")
+        gather.say(
+            "Sorry we missed your call. Please tell me what service you need, and I’ll help you right away.",
+            voice="Polly.Joanna.Neural"
+        )
 
     return Response(str(resp), mimetype="text/xml")
 
 @app.route("/process", methods=["POST"])
 def process():
     transcription = request.form.get("SpeechResult", "")
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a receptionist for a home services business. Be polite, collect name, service, and budget, and close the job with pricing."},
-            {"role": "user", "content": transcription}
-        ]
-    )
-    answer = response.choices[0].message["content"]
     resp = VoiceResponse()
-    resp.say(answer)
+
+    if not transcription:
+        resp.say("Sorry, I didn't catch that. Please try again.", voice="Polly.Joanna.Neural")
+        return Response(str(resp), mimetype="text/xml")
+
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a receptionist for a home services business. Answer naturally and politely. Collect name, service requested, and budget. Quote only accurate pricing. If you don’t know something, say so politely."},
+                {"role": "user", "content": transcription}
+            ]
+        )
+        answer = response.choices[0].message["content"]
+        resp.say(answer, voice="Polly.Joanna.Neural")
+    except Exception as e:
+        print("OpenAI error:", e)
+        resp.say("Sorry, something went wrong. I couldn't process that request.", voice="Polly.Joanna.Neural")
+
     resp.pause(length=2)
-    resp.say("Thank you, goodbye.")
+    resp.say("Thank you, goodbye.", voice="Polly.Joanna.Neural")
     return Response(str(resp), mimetype="text/xml")
 
 @app.route("/")
@@ -45,3 +59,4 @@ def home():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
