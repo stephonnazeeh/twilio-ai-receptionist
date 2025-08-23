@@ -9,7 +9,7 @@ app = Flask(__name__)
 # Initialize OpenAI client with new API
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Initialize Twilio client for SMS
+# Initialize Twilio client for SMS (still here if you want SMS later)
 twilio_client = twilio.rest.Client(
     os.getenv("TWILIO_ACCOUNT_SID"),
     os.getenv("TWILIO_AUTH_TOKEN")
@@ -18,11 +18,11 @@ twilio_client = twilio.rest.Client(
 # Store conversation states (in production, use Redis or database)
 conversations = {}
 
-# Your phone number to receive SMS summaries
+# Your phone number to receive summaries
 YOUR_PHONE_NUMBER = "+13234576314"  # Your Google Voice number
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")  # Your Twilio number
 
-# YOUR BUSINESS PRICING - Edit these as needed
+# PRICING INFO (unchanged)
 PRICING_INFO = """
 CURRENT PRICING (always mention free estimates available):
 
@@ -66,9 +66,14 @@ LANDSCAPING:
 def voice():
     resp = VoiceResponse()
     
-    # Ring your cell via Google Voice for 6 seconds - NO fallback yet
-    dial = resp.dial(timeout=6, action="/ai-pickup", method="POST")
-    dial.number("+13234576314")  # Your Google Voice number forwarding to your cell
+    # Ring your cell via Google Voice for 6 seconds - NOW RECORDING
+    dial = resp.dial(
+        timeout=6,
+        action="/ai-pickup", 
+        method="POST",
+        record="record-from-answer"   # <-- record when call is answered
+    )
+    dial.number(YOUR_PHONE_NUMBER)  # Your Google Voice number
     
     return Response(str(resp), mimetype="text/xml")
 
@@ -83,7 +88,7 @@ def ai_pickup():
         # Small pause before AI starts
         resp.pause(length=1)
         
-        # Gather speech input from the caller
+        # Gather speech input from the caller - NOW RECORDING AI CONVERSATION
         gather = resp.gather(
             input="speech", 
             timeout=4, 
@@ -91,10 +96,16 @@ def ai_pickup():
             speech_timeout="auto",
             enhanced=True
         )
-        
         gather.say(
-            "Hey there! So sorry I missed your call - I was probably helping another customer. I'm here now though, and I'd love to help you out. What kind of home service are you looking for today?",
+            "Hey there! So sorry I missed your call - I was probably helping another customer. "
+            "I'm here now though, and I'd love to help you out. What kind of home service are you looking for today?",
             voice="Polly.Joanna-Neural"
+        )
+        
+        # Also record the AI interaction
+        resp.record(
+            play_beep=False,
+            recording_status_callback="/handle-recording"
         )
         
         # Fallback if no speech detected
@@ -141,7 +152,8 @@ def process():
         messages = [
             {
                 "role": "system", 
-                "content": f"""You are Sarah, a super friendly and conversational receptionist for a home services business. Talk like a real person - use casual language, contractions, and be genuinely helpful.
+                "content": f"""You are Sarah, a super friendly and conversational receptionist for a home services business. 
+Talk like a real person - use casual language, contractions, and be genuinely helpful.
 
 {PRICING_INFO}
 
@@ -198,12 +210,10 @@ Remember: You're having a real conversation with someone who called for help!"""
         
         resp.hangup()
         
-        # Send SMS summary after call ends
-        send_call_summary(call_sid, conversations.get(call_sid, {}))
-        
     except Exception as e:
         print(f"OpenAI error: {e}")
-        resp.say("No worries, I'm having a little tech hiccup on my end. Let me just grab your name and number real quick so someone can call you right back, okay?", 
+        resp.say("No worries, I'm having a little tech hiccup on my end. "
+                 "Let me just grab your name and number real quick so someone can call you right back, okay?", 
                 voice="Polly.Joanna-Neural")
         
         # Record their info as backup
@@ -217,13 +227,13 @@ Remember: You're having a real conversation with someone who called for help!"""
 
 @app.route("/handle-recording", methods=["POST"])
 def handle_recording():
-    """Handle voicemail recordings as backup"""
+    """Handle voicemail/recording info"""
     recording_url = request.form.get("RecordingUrl")
     transcription = request.form.get("TranscriptionText")
     
-    # Log the recording info (you can add database storage here)
-    print(f"Backup recording: {recording_url}")
-    print(f"Transcription: {transcription}")
+    print(f"Recording saved: {recording_url}")
+    if transcription:
+        print(f"Transcription: {transcription}")
     
     resp = VoiceResponse()
     resp.say("Perfect, got it! Someone's definitely gonna call you back today. Thanks so much for calling!", 
@@ -231,57 +241,6 @@ def handle_recording():
     resp.hangup()
     
     return Response(str(resp), mimetype="text/xml")
-
-def send_call_summary(call_sid, conversation_data):
-    """Send SMS summary of the call to your phone"""
-    try:
-        if not conversation_data or not conversation_data.get("messages") or len(conversation_data["messages"]) < 2:
-            return  # No meaningful conversation to summarize
-        
-        messages = conversation_data["messages"]
-        caller_number = conversation_data.get("caller", "Unknown")
-        
-        # Generate summary using AI
-        summary_prompt = """Create a SHORT business call summary (1-2 sentences max). Include:
-- Customer name if mentioned
-- Service needed
-- Key outcome (quote given, scheduled, needs callback, etc.)
-- Any urgency
-
-Keep it brief and business-focused.
-
-Conversation:
-"""
-        
-        for msg in messages:
-            summary_prompt += f"{msg['role'].title()}: {msg['content']}\n"
-        
-        summary_response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Create a brief, actionable call summary for a business owner. Focus on outcomes and next steps."},
-                {"role": "user", "content": summary_prompt}
-            ],
-            max_tokens=80,
-            temperature=0.3
-        )
-        
-        summary = summary_response.choices[0].message.content.strip()
-        
-        # Format SMS message
-        sms_body = f"📞 {summary}\nFrom: {caller_number}"
-        
-        # Send SMS
-        message = twilio_client.messages.create(
-            body=sms_body,
-            from_=TWILIO_PHONE_NUMBER,
-            to=YOUR_PHONE_NUMBER
-        )
-        
-        print(f"SMS sent: {message.sid}")
-        
-    except Exception as e:
-        print(f"Error sending SMS summary: {e}")
 
 def is_conversation_ending(response):
     """Check if the AI response indicates the conversation should end"""
@@ -323,4 +282,3 @@ def cleanup_conversations():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
