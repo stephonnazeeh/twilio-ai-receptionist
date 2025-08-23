@@ -6,23 +6,30 @@ from openai import OpenAI
 
 app = Flask(__name__)
 
-# Initialize OpenAI client with new API
+# ----------------------
+# CONFIGURATION
+# ----------------------
+
+# Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Initialize Twilio client for SMS (still here if you want SMS later)
+# Initialize Twilio client
 twilio_client = twilio.rest.Client(
     os.getenv("TWILIO_ACCOUNT_SID"),
     os.getenv("TWILIO_AUTH_TOKEN")
 )
 
-# Store conversation states (in production, use Redis or database)
+# Store conversation states (in production, use Redis or DB)
 conversations = {}
 
-# Your phone number to receive summaries
-YOUR_PHONE_NUMBER = "+13234576314"  # Your Google Voice number
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")  # Your Twilio number
+# Phone numbers
+YOUR_PHONE_NUMBER = "+13234576314"  # Google Voice number
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
-# PRICING INFO (unchanged)
+# Toggle AI answering
+AI_ENABLED = True  # Set False to stop AI from answering calls
+
+# Business pricing info
 PRICING_INFO = """
 CURRENT PRICING (always mention free estimates available):
 
@@ -62,36 +69,46 @@ LANDSCAPING:
 - Irrigation install: $1500-4000
 """
 
+# ----------------------
+# ROUTES
+# ----------------------
+
 @app.route("/voice", methods=["POST"])
 def voice():
     resp = VoiceResponse()
     
-    # Ring your cell via Google Voice for 6 seconds - NOW RECORDING
+    # Ring your Google Voice number for 6 seconds, now recording
     dial = resp.dial(
         timeout=6,
-        action="/ai-pickup", 
+        action="/ai-pickup",
         method="POST",
-        record="record-from-answer"   # <-- record when call is answered
+        record="record-from-answer"  # Record from the moment call is answered
     )
-    dial.number(YOUR_PHONE_NUMBER)  # Your Google Voice number
+    dial.number(YOUR_PHONE_NUMBER)
     
     return Response(str(resp), mimetype="text/xml")
 
+
 @app.route("/ai-pickup", methods=["POST"])
 def ai_pickup():
-    """This only runs if YOU don't answer within 6 seconds"""
+    """Runs if you don’t answer within 6 seconds."""
+    if not AI_ENABLED:
+        # AI is off — hang up politely
+        resp = VoiceResponse()
+        resp.say("Sorry, the receptionist is unavailable. Please try again later.", voice="Polly.Joanna-Neural")
+        resp.hangup()
+        return Response(str(resp), mimetype="text/xml")
+    
     resp = VoiceResponse()
     dial_status = request.form.get("DialCallStatus", "")
     
-    # Only proceed if the call wasn't answered
     if dial_status in ["no-answer", "busy", "failed"]:
-        # Small pause before AI starts
         resp.pause(length=1)
         
-        # Gather speech input from the caller - NOW RECORDING AI CONVERSATION
+        # Gather speech input from caller
         gather = resp.gather(
-            input="speech", 
-            timeout=4, 
+            input="speech",
+            timeout=4,
             action="/process",
             speech_timeout="auto",
             enhanced=True
@@ -102,20 +119,16 @@ def ai_pickup():
             voice="Polly.Joanna-Neural"
         )
         
-        # Also record the AI interaction
-        resp.record(
-            play_beep=False,
-            recording_status_callback="/handle-recording"
-        )
+        # Record AI interaction as backup
+        resp.record(play_beep=False, recording_status_callback="/handle-recording")
         
-        # Fallback if no speech detected
         resp.say("Hmm, I didn't catch that. Feel free to call back when you're ready to chat!", voice="Polly.Joanna-Neural")
         resp.hangup()
     else:
-        # If you answered, just hang up the AI side
         resp.hangup()
     
     return Response(str(resp), mimetype="text/xml")
+
 
 @app.route("/process", methods=["POST"])
 def process():
@@ -126,58 +139,43 @@ def process():
     resp = VoiceResponse()
     
     if not transcription:
-        resp.say("Sorry, I couldn't quite catch that - maybe the connection cut out for a sec? What were you looking for help with?", 
-                voice="Polly.Joanna-Neural")
-        
-        # Give them another chance
+        resp.say("Sorry, I couldn't quite catch that. What were you looking for help with?", voice="Polly.Joanna-Neural")
         gather = resp.gather(
-            input="speech", 
-            timeout=4, 
+            input="speech",
+            timeout=4,
             action="/process",
             speech_timeout="auto",
             enhanced=True
         )
         gather.say("I'm all ears...", voice="Polly.Joanna-Neural")
-        
         return Response(str(resp), mimetype="text/xml")
     
     try:
-        # Get or create conversation history
         if call_sid not in conversations:
             conversations[call_sid] = {"messages": [], "caller": caller_number}
         
         conversations[call_sid]["messages"].append({"role": "user", "content": transcription})
         
-        # Create messages with conversation history
+        # Build conversation messages for OpenAI
         messages = [
             {
-                "role": "system", 
-                "content": f"""You are Sarah, a super friendly and conversational receptionist for a home services business. 
-Talk like a real person - use casual language, contractions, and be genuinely helpful.
-
+                "role": "system",
+                "content": f"""You are Sarah, a super friendly receptionist for a home services business.
 {PRICING_INFO}
 
 AVAILABILITY:
-- Monday-Friday: 8 AM - 6 PM
-- Saturday: 9 AM - 4 PM  
-- Sunday: Emergency only
-- We can usually get someone out within 24-48 hours
-- Emergency calls: same day or next morning
+- Mon-Fri: 8 AM - 6 PM
+- Sat: 9 AM - 4 PM
+- Sun: Emergency only
 
 CONVERSATION STYLE:
-- Sound like you're actually talking to someone, not reading a script
-- Use "um," "you know," and natural speech patterns occasionally
-- Keep responses under 30 words but be conversational
-- Ask follow-up questions naturally
-- Get their name early and use it
-- If they want to schedule, get name, phone, service, and preferred timing
-- Always mention we do free estimates
-
-Remember: You're having a real conversation with someone who called for help!"""
+- Casual, helpful, conversational
+- Use contractions, ask follow-ups naturally
+- Keep responses short (under 30 words)
+- Always mention free estimates
+"""
             }
         ]
-        
-        # Add conversation history (keep last 6 messages for context)
         messages.extend(conversations[call_sid]["messages"][-6:])
         
         response = client.chat.completions.create(
@@ -192,18 +190,15 @@ Remember: You're having a real conversation with someone who called for help!"""
         
         resp.say(answer, voice="Polly.Joanna-Neural")
         
-        # Continue conversation unless it's clearly ending
         if not is_conversation_ending(answer):
             gather = resp.gather(
-                input="speech", 
-                timeout=5, 
+                input="speech",
+                timeout=5,
                 action="/process",
                 speech_timeout="auto",
                 enhanced=True
             )
             gather.say("Is there anything else I can help you with today?", voice="Polly.Joanna-Neural")
-            
-            # Fallback ending
             resp.say("Thanks for calling! Have a great day!", voice="Polly.Joanna-Neural")
         else:
             resp.say("Thanks so much for calling! We'll be in touch soon.", voice="Polly.Joanna-Neural")
@@ -212,22 +207,14 @@ Remember: You're having a real conversation with someone who called for help!"""
         
     except Exception as e:
         print(f"OpenAI error: {e}")
-        resp.say("No worries, I'm having a little tech hiccup on my end. "
-                 "Let me just grab your name and number real quick so someone can call you right back, okay?", 
-                voice="Polly.Joanna-Neural")
-        
-        # Record their info as backup
-        resp.record(
-            action="/handle-recording",
-            max_length=60,
-            transcribe=True
-        )
+        resp.say("No worries, I'm having a little tech hiccup. Let me grab your name and number quickly.", voice="Polly.Joanna-Neural")
+        resp.record(action="/handle-recording", max_length=60, transcribe=True)
     
     return Response(str(resp), mimetype="text/xml")
 
+
 @app.route("/handle-recording", methods=["POST"])
 def handle_recording():
-    """Handle voicemail/recording info"""
     recording_url = request.form.get("RecordingUrl")
     transcription = request.form.get("TranscriptionText")
     
@@ -236,14 +223,17 @@ def handle_recording():
         print(f"Transcription: {transcription}")
     
     resp = VoiceResponse()
-    resp.say("Perfect, got it! Someone's definitely gonna call you back today. Thanks so much for calling!", 
-            voice="Polly.Joanna-Neural")
+    resp.say("Perfect, got it! Someone will call you back today. Thanks for calling!", voice="Polly.Joanna-Neural")
     resp.hangup()
     
     return Response(str(resp), mimetype="text/xml")
 
+
+# ----------------------
+# HELPER FUNCTIONS
+# ----------------------
+
 def is_conversation_ending(response):
-    """Check if the AI response indicates the conversation should end"""
     ending_phrases = [
         "thanks for calling",
         "have a great day",
@@ -253,9 +243,12 @@ def is_conversation_ending(response):
         "goodbye",
         "we'll contact you"
     ]
-    
-    response_lower = response.lower()
-    return any(phrase in response_lower for phrase in ending_phrases)
+    return any(phrase in response.lower() for phrase in ending_phrases)
+
+
+# ----------------------
+# MISC
+# ----------------------
 
 @app.route("/")
 def home():
@@ -263,18 +256,15 @@ def home():
 
 @app.route("/health")
 def health():
-    """Health check endpoint"""
     return {
         "status": "healthy",
         "openai_key": "set" if os.getenv("OPENAI_API_KEY") else "missing",
         "twilio_configured": "yes" if os.getenv("TWILIO_ACCOUNT_SID") else "no"
     }, 200
 
-# Clean up old conversations periodically (basic cleanup)
 @app.before_request
 def cleanup_conversations():
     if len(conversations) > 100:
-        # Keep only the 50 most recent conversations
         keys_to_remove = list(conversations.keys())[:-50]
         for key in keys_to_remove:
             del conversations[key]
@@ -282,3 +272,4 @@ def cleanup_conversations():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
