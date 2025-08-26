@@ -1,6 +1,5 @@
 Flask==2.3.3
 twilio==8.11.0
-openai==1.9.7
+openai==1.12.0
 gunicorn==21.2.0
 elevenlabs==0.2.26
-requests==2.32.5
