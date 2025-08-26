@@ -1,11 +1,13 @@
-from flask import Flask, request, Response
+from flask import Flask, request, Response, send_file
 from twilio.twiml.voice_response import VoiceResponse, Gather
 import twilio.rest
 import os
 from openai import OpenAI
 from elevenlabs import generate, set_api_key
-import base64
-import io
+import tempfile
+import uuid
+import threading
+import time
 
 app = Flask(__name__)
 
@@ -18,6 +20,9 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Initialize ElevenLabs
 set_api_key(os.getenv("ELEVENLABS_API_KEY"))
+
+# Store temporary audio files
+temp_audio_files = {}
 
 # Initialize Twilio client
 twilio_client = twilio.rest.Client(
@@ -97,11 +102,12 @@ IMPORTANT: We specialize in TV mounting only - no other services!
 # ----------------------
 
 def generate_speech_elevenlabs(text):
-    """Generate speech using ElevenLabs"""
+    """Generate speech using ElevenLabs and create temporary URL"""
     try:
+        # Generate audio with ElevenLabs
         audio = generate(
             text=text,
-            voice="yM93hbw8Qtvdma2wCnJG",  # Your custom ElevenLabs voice
+            voice="yM93hbw8Qtvdma2wCnJG",
             model="eleven_multilingual_v2",
             voice_settings={
                 "stability": 0.5,
@@ -111,14 +117,53 @@ def generate_speech_elevenlabs(text):
             }
         )
         
-        # Convert to base64 for Twilio
-        audio_b64 = base64.b64encode(audio).decode('utf-8')
-        return f"data:audio/mpeg;base64,{audio_b64}"
+        # Create unique filename
+        audio_id = str(uuid.uuid4())
+        
+        # Store audio in memory temporarily
+        temp_audio_files[audio_id] = {
+            'data': audio,
+            'timestamp': time.time()
+        }
+        
+        # Return URL that our app can serve
+        base_url = os.getenv("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")
+        return f"{base_url}/audio/{audio_id}.mp3"
         
     except Exception as e:
         print(f"ElevenLabs error: {e}")
-        # Fallback to Twilio TTS
         return None
+
+def cleanup_old_audio():
+    """Remove audio files older than 10 minutes"""
+    current_time = time.time()
+    to_remove = []
+    for audio_id, data in temp_audio_files.items():
+        if current_time - data['timestamp'] > 600:  # 10 minutes
+            to_remove.append(audio_id)
+    
+    for audio_id in to_remove:
+        del temp_audio_files[audio_id]
+
+@app.route("/audio/<audio_id>.mp3")
+def serve_audio(audio_id):
+    """Serve temporary audio files"""
+    cleanup_old_audio()
+    
+    if audio_id not in temp_audio_files:
+        return "Audio not found", 404
+    
+    audio_data = temp_audio_files[audio_id]['data']
+    
+    # Create temporary file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+    temp_file.write(audio_data)
+    temp_file.close()
+    
+    return send_file(temp_file.name, 
+                     mimetype='audio/mpeg',
+                     as_attachment=False,
+                     download_name=f"{audio_id}.mp3")
 
 # ----------------------
 # ROUTES
@@ -173,7 +218,7 @@ def ai_pickup():
         if audio_url:
             gather.play(audio_url)
         else:
-            gather.say(greeting_text, voice="Polly.Joanna-Neural")
+            gather.say(greeting_text, voice="Polly.Matthew-Neural")
         
         # Record AI interaction as backup
         resp.record(play_beep=False, recording_status_callback="/handle-recording")
@@ -184,7 +229,7 @@ def ai_pickup():
         if fallback_audio:
             resp.play(fallback_audio)
         else:
-            resp.say(fallback_text, voice="Polly.Joanna-Neural")
+            resp.say(fallback_text, voice="Polly.Matthew-Neural")
             
         resp.hangup()
     else:
@@ -208,7 +253,7 @@ def process():
         if clarify_audio:
             resp.play(clarify_audio)
         else:
-            resp.say(clarify_text, voice="Polly.Joanna-Neural")
+            resp.say(clarify_text, voice="Polly.Matthew-Neural")
             
         gather = resp.gather(
             input="speech",
@@ -224,7 +269,7 @@ def process():
         if prompt_audio:
             gather.play(prompt_audio)
         else:
-            gather.say(prompt_text, voice="Polly.Joanna-Neural")
+            gather.say(prompt_text, voice="Polly.Matthew-Neural")
             
         return Response(str(resp), mimetype="text/xml")
     
@@ -291,7 +336,7 @@ STYLE: Professional, helpful, follow the flow step by step. Calculate totals whe
         if answer_audio:
             resp.play(answer_audio)
         else:
-            resp.say(answer, voice="Polly.Joanna-Neural")
+            resp.say(answer, voice="Polly.Matthew-Neural")
         
         if not is_conversation_ending(answer):
             gather = resp.gather(
@@ -308,7 +353,7 @@ STYLE: Professional, helpful, follow the flow step by step. Calculate totals whe
             if followup_audio:
                 gather.play(followup_audio)
             else:
-                gather.say(followup_text, voice="Polly.Joanna-Neural")
+                gather.say(followup_text, voice="Polly.Matthew-Neural")
                 
             closing_text = "Thanks for calling! Have a great day!"
             closing_audio = generate_speech_elevenlabs(closing_text)
@@ -316,7 +361,7 @@ STYLE: Professional, helpful, follow the flow step by step. Calculate totals whe
             if closing_audio:
                 resp.play(closing_audio)
             else:
-                resp.say(closing_text, voice="Polly.Joanna-Neural")
+                resp.say(closing_text, voice="Polly.Matthew-Neural")
         else:
             final_text = "Thanks so much for calling! We'll be in touch soon to schedule your mounting."
             final_audio = generate_speech_elevenlabs(final_text)
@@ -324,7 +369,7 @@ STYLE: Professional, helpful, follow the flow step by step. Calculate totals whe
             if final_audio:
                 resp.play(final_audio)
             else:
-                resp.say(final_text, voice="Polly.Joanna-Neural")
+                resp.say(final_text, voice="Polly.Matthew-Neural")
         
         resp.hangup()
         
@@ -336,7 +381,7 @@ STYLE: Professional, helpful, follow the flow step by step. Calculate totals whe
         if error_audio:
             resp.play(error_audio)
         else:
-            resp.say(error_text, voice="Polly.Joanna-Neural")
+            resp.say(error_text, voice="Polly.Matthew-Neural")
             
         resp.record(action="/handle-recording", max_length=60, transcribe=True)
     
@@ -360,7 +405,7 @@ def handle_recording():
     if final_audio:
         resp.play(final_audio)
     else:
-        resp.say(final_text, voice="Polly.Joanna-Neural")
+        resp.say(final_text, voice="Polly.Matthew-Neural")
         
     resp.hangup()
     
@@ -413,4 +458,3 @@ def cleanup_conversations():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
