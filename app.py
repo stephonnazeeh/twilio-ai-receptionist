@@ -3,8 +3,7 @@ from twilio.twiml.voice_response import VoiceResponse, Gather
 import twilio.rest
 import os
 from openai import OpenAI
-from elevenlabs.client import ElevenLabs
-from elevenlabs import VoiceSettings
+from elevenlabs import generate, set_api_key
 import tempfile
 import uuid
 import threading
@@ -19,8 +18,8 @@ app = Flask(__name__)
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Initialize ElevenLabs client
-elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+# Initialize ElevenLabs
+set_api_key(os.getenv("ELEVENLABS_API_KEY"))
 
 # Store temporary audio files
 temp_audio_files = {}
@@ -105,28 +104,25 @@ IMPORTANT: We specialize in TV mounting only - no other services!
 def generate_speech_elevenlabs(text):
     """Generate speech using ElevenLabs and create temporary URL"""
     try:
-        # Generate audio with ElevenLabs
-        audio_generator = elevenlabs_client.generate(
+        # Generate audio with ElevenLabs (older API)
+        audio = generate(
             text=text,
             voice="yM93hbw8Qtvdma2wCnJG",
             model="eleven_multilingual_v2",
-            voice_settings=VoiceSettings(
-                stability=0.5,
-                similarity_boost=0.8,
-                style=0.2,
-                use_speaker_boost=True
-            )
+            voice_settings={
+                "stability": 0.5,
+                "similarity_boost": 0.8,
+                "style": 0.2,
+                "use_speaker_boost": True
+            }
         )
-        
-        # Convert generator to bytes
-        audio_bytes = b"".join(chunk for chunk in audio_generator)
         
         # Create unique filename
         audio_id = str(uuid.uuid4())
         
         # Store audio in memory temporarily
         temp_audio_files[audio_id] = {
-            'data': audio_bytes,
+            'data': audio,
             'timestamp': time.time()
         }
         
