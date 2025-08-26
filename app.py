@@ -105,8 +105,8 @@ IMPORTANT: We specialize in TV mounting only - no other services!
 def generate_speech_elevenlabs(text):
     """Generate speech using ElevenLabs and create temporary URL"""
     try:
-        # Generate audio with ElevenLabs new API
-        audio = elevenlabs_client.generate(
+        # Generate audio with ElevenLabs
+        audio_generator = elevenlabs_client.generate(
             text=text,
             voice="yM93hbw8Qtvdma2wCnJG",
             model="eleven_multilingual_v2",
@@ -119,7 +119,7 @@ def generate_speech_elevenlabs(text):
         )
         
         # Convert generator to bytes
-        audio_bytes = b"".join(audio)
+        audio_bytes = b"".join(chunk for chunk in audio_generator)
         
         # Create unique filename
         audio_id = str(uuid.uuid4())
