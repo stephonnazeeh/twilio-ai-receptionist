@@ -6,7 +6,6 @@ from openai import OpenAI
 from elevenlabs import generate, set_api_key
 import tempfile
 import uuid
-import threading
 import time
 
 app = Flask(__name__)
@@ -15,25 +14,16 @@ app = Flask(__name__)
 # CONFIGURATION
 # ----------------------
 
-# Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Initialize ElevenLabs
 set_api_key(os.getenv("ELEVENLABS_API_KEY"))
 
-# Store temporary audio files
-temp_audio_files = {}
-
-# Initialize Twilio client
 twilio_client = twilio.rest.Client(
     os.getenv("TWILIO_ACCOUNT_SID"),
     os.getenv("TWILIO_AUTH_TOKEN")
 )
 
-# Store conversation states (in production, use Redis or DB)
+temp_audio_files = {}
 conversations = {}
-
-# Store scheduling (in production, use Redis or DB)
 scheduled_days = {
     "monday": False,
     "tuesday": False,
@@ -44,14 +34,10 @@ scheduled_days = {
     "sunday": False
 }
 
-# Phone numbers
 YOUR_PHONE_NUMBER = "+13234576314"  # Google Voice number
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
-
-# Toggle AI answering
 AI_ENABLED = True
 
-# Business pricing info
 PRICING_INFO = """
 TV MOUNTING SERVICES - MOUNT MASTERS:
 
@@ -97,11 +83,10 @@ IMPORTANT: We only do TV mounting — nothing else!
 """
 
 # ----------------------
-# ELEVENLABS HELPER
+# ELEVENLABS HELPERS
 # ----------------------
 
 def generate_speech_elevenlabs(text):
-    """Generate speech using ElevenLabs and create temporary URL"""
     try:
         audio = generate(
             text=text,
@@ -114,92 +99,69 @@ def generate_speech_elevenlabs(text):
                 "use_speaker_boost": True
             }
         )
-        
         audio_id = str(uuid.uuid4())
-        temp_audio_files[audio_id] = {
-            'data': audio,
-            'timestamp': time.time()
-        }
-        
+        temp_audio_files[audio_id] = {'data': audio, 'timestamp': time.time()}
         base_url = os.getenv("RENDER_EXTERNAL_URL", "https://twilio-ai-receptionist.onrender.com")
         return f"{base_url}/audio/{audio_id}.mp3"
-        
     except Exception as e:
         print(f"ElevenLabs error: {e}")
         return None
 
 def cleanup_old_audio():
-    """Remove audio files older than 10 minutes"""
-    current_time = time.time()
-    to_remove = []
-    for audio_id, data in temp_audio_files.items():
-        if current_time - data['timestamp'] > 600:
-            to_remove.append(audio_id)
-    for audio_id in to_remove:
-        del temp_audio_files[audio_id]
+    now = time.time()
+    for key in list(temp_audio_files.keys()):
+        if now - temp_audio_files[key]['timestamp'] > 600:
+            del temp_audio_files[key]
 
 @app.route("/audio/<audio_id>.mp3")
 def serve_audio(audio_id):
     cleanup_old_audio()
     if audio_id not in temp_audio_files:
         return "Audio not found", 404
-    
-    audio_data = temp_audio_files[audio_id]['data']
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
-    temp_file.write(audio_data)
-    temp_file.close()
-    
-    return send_file(temp_file.name, mimetype='audio/mpeg',
-                     as_attachment=False,
-                     download_name=f"{audio_id}.mp3")
+    data = temp_audio_files[audio_id]['data']
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tmp.write(data)
+    tmp.close()
+    return send_file(tmp.name, mimetype='audio/mpeg', as_attachment=False, download_name=f"{audio_id}.mp3")
 
 # ----------------------
-# ROUTES
+# TWILIO ROUTES
 # ----------------------
 
 @app.route("/voice", methods=["POST"])
 def voice():
     resp = VoiceResponse()
-    dial = resp.dial(timeout=6, action="/ai-pickup",
-                     method="POST", record="record-from-answer")
+    dial = resp.dial(timeout=6, action="/ai-pickup", method="POST", record="record-from-answer")
     dial.number(YOUR_PHONE_NUMBER)
     return Response(str(resp), mimetype="text/xml")
 
 @app.route("/ai-pickup", methods=["POST"])
 def ai_pickup():
+    resp = VoiceResponse()
     if not AI_ENABLED:
-        resp = VoiceResponse()
         resp.say("Sorry, the receptionist is unavailable. Please try again later.")
         resp.hangup()
         return Response(str(resp), mimetype="text/xml")
-    
-    resp = VoiceResponse()
+
     dial_status = request.form.get("DialCallStatus", "")
-    
     if dial_status in ["no-answer", "busy", "failed"]:
-        greeting_text = "Thank you for calling Mount Masters, this is Daniel, how can I help you today?"
-        audio_url = generate_speech_elevenlabs(greeting_text)
-        
-        gather = resp.gather(input="speech", timeout=4, action="/process",
-                             speech_timeout="auto", enhanced=True)
+        greeting = "Thank you for calling Mount Masters, this is Daniel, how can I help you today?"
+        audio_url = generate_speech_elevenlabs(greeting)
+        gather = resp.gather(input="speech", timeout=4, action="/process", speech_timeout="auto", enhanced=True)
         if audio_url:
             gather.play(audio_url)
         else:
-            gather.say(greeting_text)
-        
+            gather.say(greeting)
         resp.record(play_beep=False, recording_status_callback="/handle-recording")
-        
         fallback_text = "I didn't catch that. Feel free to call Mount Masters back anytime!"
         fallback_audio = generate_speech_elevenlabs(fallback_text)
         if fallback_audio:
             resp.play(fallback_audio)
         else:
             resp.say(fallback_text)
-            
         resp.hangup()
     else:
         resp.hangup()
-    
     return Response(str(resp), mimetype="text/xml")
 
 @app.route("/process", methods=["POST"])
@@ -207,102 +169,72 @@ def process():
     transcription = request.form.get("SpeechResult", "")
     call_sid = request.form.get("CallSid", "")
     caller_number = request.form.get("From", "Unknown")
-    
     resp = VoiceResponse()
-    
-    if not transcription:
-        clarify_text = "Sorry, I couldn't quite catch that. How can I help you today?"
+
+    if call_sid not in conversations:
+        conversations[call_sid] = {"messages": [], "caller": caller_number}
+
+    if transcription:
+        conversations[call_sid]["messages"].append({"role": "user", "content": transcription})
+        messages = [{"role": "system", "content": f"You are Daniel, a TV mounting receptionist.\n{PRICING_INFO}"}]
+        messages.extend(conversations[call_sid]["messages"][-6:])
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=120,
+                temperature=0.7
+            )
+            answer = response.choices[0].message.content
+            conversations[call_sid]["messages"].append({"role": "assistant", "content": answer})
+            audio_url = generate_speech_elevenlabs(answer)
+            if audio_url:
+                resp.play(audio_url)
+            else:
+                resp.say(answer)
+            if not any(phrase in answer.lower() for phrase in [
+                "thanks for calling", "have a great day", "we'll be in touch",
+                "someone will call you", "talk to you soon", "goodbye",
+                "we'll contact you", "schedule your mounting"
+            ]):
+                gather = resp.gather(input="speech", timeout=5, action="/process",
+                                     speech_timeout="auto", enhanced=True)
+                followup_text = "Anything else I can help you with?"
+                followup_audio = generate_speech_elevenlabs(followup_text)
+                if followup_audio:
+                    gather.play(followup_audio)
+                else:
+                    gather.say(followup_text)
+                closing_text = "Thanks for calling! Have a great day!"
+                closing_audio = generate_speech_elevenlabs(closing_text)
+                if closing_audio:
+                    resp.play(closing_audio)
+                else:
+                    resp.say(closing_text)
+            else:
+                final_text = "Thanks so much for calling! We'll be in touch soon to schedule your mounting."
+                final_audio = generate_speech_elevenlabs(final_text)
+                if final_audio:
+                    resp.play(final_audio)
+                else:
+                    resp.say(final_text)
+        except Exception as e:
+            print(f"OpenAI error: {e}")
+            error_text = "No worries, I'm having a little tech hiccup. Let me grab your name and number quickly."
+            error_audio = generate_speech_elevenlabs(error_text)
+            if error_audio:
+                resp.play(error_audio)
+            else:
+                resp.say(error_text)
+            resp.record(action="/handle-recording", max_length=60, transcribe=True)
+    else:
+        clarify_text = "Sorry, I couldn't catch that. How can I help you today?"
         clarify_audio = generate_speech_elevenlabs(clarify_text)
         if clarify_audio:
             resp.play(clarify_audio)
         else:
             resp.say(clarify_text)
-            
-        gather = resp.gather(input="speech", timeout=4, action="/process",
-                             speech_timeout="auto", enhanced=True)
-        prompt_text = "I'm all ears..."
-        prompt_audio = generate_speech_elevenlabs(prompt_text)
-        if prompt_audio:
-            gather.play(prompt_audio)
-        else:
-            gather.say(prompt_text)
-        return Response(str(resp), mimetype="text/xml")
-    
-    try:
-        if call_sid not in conversations:
-            conversations[call_sid] = {"messages": [], "caller": caller_number}
-        conversations[call_sid]["messages"].append({"role": "user", "content": transcription})
-        
-        messages = [{
-            "role": "system",
-            "content": f"""You are Daniel, a TV mounting receptionist. Follow this exact flow:
-
-{PRICING_INFO}
-
-CURRENT SCHEDULE STATUS:
-Monday: {"Booked" if scheduled_days["monday"] else "Available 7:30 PM+"}
-Tuesday: {"Booked" if scheduled_days["tuesday"] else "Available after 12 PM"}  
-Wednesday: {"Booked" if scheduled_days["wednesday"] else "Available after 12 PM"}
-Thursday: {"Booked" if scheduled_days["thursday"] else "Available 7:30 PM+"}
-Friday: {"Booked" if scheduled_days["friday"] else "Available 7:30 PM+"}
-Saturday: {"Booked" if scheduled_days["saturday"] else "Available 7:30 PM+"}
-Sunday: {"Booked" if scheduled_days["sunday"] else "Available 7:30 PM+"}
-"""
-        }]
-        messages.extend(conversations[call_sid]["messages"][-6:])
-        
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=120,
-            temperature=0.7
-        )
-        
-        answer = response.choices[0].message.content
-        conversations[call_sid]["messages"].append({"role": "assistant", "content": answer})
-        
-        answer_audio = generate_speech_elevenlabs(answer)
-        if answer_audio:
-            resp.play(answer_audio)
-        else:
-            resp.say(answer)
-        
-        if not is_conversation_ending(answer):
-            gather = resp.gather(input="speech", timeout=5, action="/process",
-                                 speech_timeout="auto", enhanced=True)
-            followup_text = "Anything else I can help you with?"
-            followup_audio = generate_speech_elevenlabs(followup_text)
-            if followup_audio:
-                gather.play(followup_audio)
-            else:
-                gather.say(followup_text)
-                
-            closing_text = "Thanks for calling! Have a great day!"
-            closing_audio = generate_speech_elevenlabs(closing_text)
-            if closing_audio:
-                resp.play(closing_audio)
-            else:
-                resp.say(closing_text)
-        else:
-            final_text = "Thanks so much for calling! We'll be in touch soon to schedule your mounting."
-            final_audio = generate_speech_elevenlabs(final_text)
-            if final_audio:
-                resp.play(final_audio)
-            else:
-                resp.say(final_text)
-        
-        resp.hangup()
-        
-    except Exception as e:
-        print(f"OpenAI error: {e}")
-        error_text = "No worries, I'm having a little tech hiccup. Let me grab your name and number quickly."
-        error_audio = generate_speech_elevenlabs(error_text)
-        if error_audio:
-            resp.play(error_audio)
-        else:
-            resp.say(error_text)
-        resp.record(action="/handle-recording", max_length=60, transcribe=True)
-    
+    resp.hangup()
     return Response(str(resp), mimetype="text/xml")
 
 @app.route("/handle-recording", methods=["POST"])
@@ -312,7 +244,6 @@ def handle_recording():
     print(f"Recording saved: {recording_url}")
     if transcription:
         print(f"Transcription: {transcription}")
-    
     resp = VoiceResponse()
     final_text = "Perfect, got it! Someone will call you back today to schedule your TV mounting. Thanks!"
     final_audio = generate_speech_elevenlabs(final_text)
@@ -324,24 +255,7 @@ def handle_recording():
     return Response(str(resp), mimetype="text/xml")
 
 # ----------------------
-# HELPER FUNCTIONS
-# ----------------------
-
-def is_conversation_ending(response):
-    ending_phrases = [
-        "thanks for calling",
-        "have a great day", 
-        "we'll be in touch",
-        "someone will call you",
-        "talk to you soon",
-        "goodbye",
-        "we'll contact you",
-        "schedule your mounting"
-    ]
-    return any(phrase in response.lower() for phrase in ending_phrases)
-
-# ----------------------
-# MISC
+# HEALTH & HOME
 # ----------------------
 
 @app.route("/")
@@ -368,3 +282,4 @@ def cleanup_conversations():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
