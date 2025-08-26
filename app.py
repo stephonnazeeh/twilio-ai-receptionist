@@ -3,6 +3,9 @@ from twilio.twiml.voice_response import VoiceResponse, Gather
 import twilio.rest
 import os
 from openai import OpenAI
+from elevenlabs import generate, set_api_key
+import base64
+import io
 
 app = Flask(__name__)
 
@@ -13,6 +16,9 @@ app = Flask(__name__)
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Initialize ElevenLabs
+set_api_key(os.getenv("ELEVENLABS_API_KEY"))
+
 # Initialize Twilio client
 twilio_client = twilio.rest.Client(
     os.getenv("TWILIO_ACCOUNT_SID"),
@@ -21,6 +27,18 @@ twilio_client = twilio.rest.Client(
 
 # Store conversation states (in production, use Redis or DB)
 conversations = {}
+
+# Store scheduling (in production, use Redis or DB)
+# Format: {"monday": False, "tuesday": False, "wednesday": False, "thursday": False, "friday": False, "saturday": False, "sunday": False}
+scheduled_days = {
+    "monday": False,
+    "tuesday": False, 
+    "wednesday": False,
+    "thursday": False,
+    "friday": False,
+    "saturday": False,
+    "sunday": False
+}
 
 # Phone numbers
 YOUR_PHONE_NUMBER = "+13234576314"  # Google Voice number
@@ -31,43 +49,76 @@ AI_ENABLED = True  # Set False to stop AI from answering calls
 
 # Business pricing info
 PRICING_INFO = """
-CURRENT PRICING (always mention free estimates available):
+TV MOUNTING SERVICES - MOUNT MASTERS:
 
-PLUMBING:
-- Basic repairs (leaks, clogs): $150-250
-- Toilet/faucet replacement: $200-400
-- Water heater repair: $300-500
-- Major plumbing (repiping): $1000-3000
+TV MOUNTING PRICES:
+- 28-49": $99 for mounting
+- 50-76": $120 for mounting  
+- 77-86": $139 for mounting
+- Multiple TVs: Calculate each TV separately
 
-ELECTRICAL:
-- Outlet/switch work: $150-300
-- Light fixture install: $100-250
-- Panel upgrades: $1200-2500
-- Whole house rewiring: $3000-8000
+TV MOUNTS (if customer needs one):
+- Full Motion Mount: $65 (swivels, tilts, extends from wall - perfect for corner viewing or reducing glare)
+- Standard Mount: $35 (fixed position, sits flat against wall)
+- No charge for bracket if customer has their own
 
-HVAC:
-- AC tune-up: $150-200
-- Repair calls: $200-400
-- New AC unit: $3500-7000
-- Ductwork: $1500-4000
+CORD HIDING OPTIONS:
+- Hiding cords with outlet behind TV: $175 per TV (cleanest, most premium look)
+- Plastic cord cover: Available option (mention as alternative)
+- Leave cords hanging: Free option
 
-HANDYMAN:
-- $85/hour (2 hour minimum)
-- Most small jobs: $200-500
-- Drywall repair: $150-300
-- Painting (per room): $300-800
+OTHER SERVICES:
+- TV takedown/removal: $70 per TV
 
-CLEANING:
-- Regular house cleaning: $120-250
-- Deep cleaning: $200-400
-- Move-in/out: $250-500
+SERVICE AREA:
+- Los Angeles and within 25 mile radius
+- Outside 25 miles: Owner callback required, collect number
+- Over 50 miles/other states: Politely decline, don't service that area
 
-LANDSCAPING:
-- Lawn maintenance: $50-100/visit
-- Tree trimming: $300-800
-- Landscape design: $800-2500
-- Irrigation install: $1500-4000
+SCHEDULING:
+- Same day mounting available
+- Mon/Thu/Fri/Sat/Sun: 7:30 PM or later (high demand during day)
+- Tuesday/Wednesday: Anytime after 12 PM
+- Track bookings: Only one appointment per day, schedule next available day
+
+CONVERSATION FLOW:
+1. Greet: "Thank you for calling Mount Masters, this is Daniel, how can I help you?"
+2. Ask TV size and quantity
+3. Ask what city they're in (check service area)
+4. Ask about cord hiding preferences  
+5. Offer same day mounting
+6. Schedule based on availability
+
+IMPORTANT: We specialize in TV mounting only - no other services!
 """
+
+# ----------------------
+# ELEVENLABS HELPER
+# ----------------------
+
+def generate_speech_elevenlabs(text):
+    """Generate speech using ElevenLabs"""
+    try:
+        audio = generate(
+            text=text,
+            voice="yM93hbw8Qtvdma2wCnJG",  # Your custom ElevenLabs voice
+            model="eleven_multilingual_v2",
+            voice_settings={
+                "stability": 0.5,
+                "similarity_boost": 0.8,
+                "style": 0.2,
+                "use_speaker_boost": True
+            }
+        )
+        
+        # Convert to base64 for Twilio
+        audio_b64 = base64.b64encode(audio).decode('utf-8')
+        return f"data:audio/mpeg;base64,{audio_b64}"
+        
+    except Exception as e:
+        print(f"ElevenLabs error: {e}")
+        # Fallback to Twilio TTS
+        return None
 
 # ----------------------
 # ROUTES
@@ -91,7 +142,7 @@ def voice():
 
 @app.route("/ai-pickup", methods=["POST"])
 def ai_pickup():
-    """Runs if you don’t answer within 6 seconds."""
+    """Runs if you don't answer within 6 seconds."""
     if not AI_ENABLED:
         # AI is off — hang up politely
         resp = VoiceResponse()
@@ -105,6 +156,11 @@ def ai_pickup():
     if dial_status in ["no-answer", "busy", "failed"]:
         resp.pause(length=1)
         
+        # Try ElevenLabs first, fallback to Twilio TTS
+        greeting_text = "Thank you for calling Mount Masters, this is Daniel, how can I help you today?"
+        
+        audio_url = generate_speech_elevenlabs(greeting_text)
+        
         # Gather speech input from caller
         gather = resp.gather(
             input="speech",
@@ -113,16 +169,23 @@ def ai_pickup():
             speech_timeout="auto",
             enhanced=True
         )
-        gather.say(
-            "Hey there! So sorry I missed your call - I was probably helping another customer. "
-            "I'm here now though, and I'd love to help you out. What kind of home service are you looking for today?",
-            voice="Polly.Joanna-Neural"
-        )
+        
+        if audio_url:
+            gather.play(audio_url)
+        else:
+            gather.say(greeting_text, voice="Polly.Joanna-Neural")
         
         # Record AI interaction as backup
         resp.record(play_beep=False, recording_status_callback="/handle-recording")
         
-        resp.say("Hmm, I didn't catch that. Feel free to call back when you're ready to chat!", voice="Polly.Joanna-Neural")
+        fallback_text = "I didn't catch that. Feel free to call Mount Masters back anytime!"
+        fallback_audio = generate_speech_elevenlabs(fallback_text)
+        
+        if fallback_audio:
+            resp.play(fallback_audio)
+        else:
+            resp.say(fallback_text, voice="Polly.Joanna-Neural")
+            
         resp.hangup()
     else:
         resp.hangup()
@@ -139,7 +202,14 @@ def process():
     resp = VoiceResponse()
     
     if not transcription:
-        resp.say("Sorry, I couldn't quite catch that. What were you looking for help with?", voice="Polly.Joanna-Neural")
+        clarify_text = "Sorry, I couldn't quite catch that. How can I help you today?"
+        clarify_audio = generate_speech_elevenlabs(clarify_text)
+        
+        if clarify_audio:
+            resp.play(clarify_audio)
+        else:
+            resp.say(clarify_text, voice="Polly.Joanna-Neural")
+            
         gather = resp.gather(
             input="speech",
             timeout=4,
@@ -147,7 +217,15 @@ def process():
             speech_timeout="auto",
             enhanced=True
         )
-        gather.say("I'm all ears...", voice="Polly.Joanna-Neural")
+        
+        prompt_text = "I'm all ears..."
+        prompt_audio = generate_speech_elevenlabs(prompt_text)
+        
+        if prompt_audio:
+            gather.play(prompt_audio)
+        else:
+            gather.say(prompt_text, voice="Polly.Joanna-Neural")
+            
         return Response(str(resp), mimetype="text/xml")
     
     try:
@@ -160,19 +238,30 @@ def process():
         messages = [
             {
                 "role": "system",
-                "content": f"""You are Sarah, a super friendly receptionist for a home services business.
+                "content": f"""You are Daniel, a professional TV mounting receptionist for Mount Masters. Follow this EXACT conversation flow:
+
 {PRICING_INFO}
 
-AVAILABILITY:
-- Mon-Fri: 8 AM - 6 PM
-- Sat: 9 AM - 4 PM
-- Sun: Emergency only
+CONVERSATION FLOW (FOLLOW IN ORDER):
+1. If they inquire about TV mounting, ask: "What size TV and how many TVs are you looking to mount?"
+2. Next ask: "What city are you in?" 
+   - Los Angeles/within 25 miles: Continue
+   - Outside 25 miles: "You'll need a callback from our owner. Can I get your number?"  
+   - Over 50 miles/other states: "Sorry, we don't service that area, but feel free to chat if you'd like."
+3. Ask about cord hiding: "How would you like the cords handled - hidden behind the wall with an outlet, cord covers, or left hanging?"
+4. Offer same day: "We do same day TV mounting. Would you like your TV mounted today?"
+5. Schedule based on availability - check what days are booked
 
-CONVERSATION STYLE:
-- Casual, helpful, conversational
-- Use contractions, ask follow-ups naturally
-- Keep responses short (under 30 words)
-- Always mention free estimates
+CURRENT SCHEDULE STATUS:
+Monday: {"Booked" if scheduled_days["monday"] else "Available 7:30 PM+"}
+Tuesday: {"Booked" if scheduled_days["tuesday"] else "Available after 12 PM"}  
+Wednesday: {"Booked" if scheduled_days["wednesday"] else "Available after 12 PM"}
+Thursday: {"Booked" if scheduled_days["thursday"] else "Available 7:30 PM+"}
+Friday: {"Booked" if scheduled_days["friday"] else "Available 7:30 PM+"}
+Saturday: {"Booked" if scheduled_days["saturday"] else "Available 7:30 PM+"}
+Sunday: {"Booked" if scheduled_days["sunday"] else "Available 7:30 PM+"}
+
+STYLE: Professional, helpful, follow the flow step by step. Calculate totals when appropriate.
 """
             }
         ]
@@ -181,14 +270,28 @@ CONVERSATION STYLE:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            max_tokens=100,
+            max_tokens=120,
             temperature=0.7
         )
         
         answer = response.choices[0].message.content
         conversations[call_sid]["messages"].append({"role": "assistant", "content": answer})
         
-        resp.say(answer, voice="Polly.Joanna-Neural")
+        # Check if we need to update scheduling based on the response
+        if "7:30" in answer.lower() and any(day in answer.lower() for day in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]):
+            for day in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]:
+                if day in answer.lower():
+                    scheduled_days[day] = True
+                    print(f"Scheduled appointment for {day}")
+                    break
+        
+        # Generate speech with ElevenLabs
+        answer_audio = generate_speech_elevenlabs(answer)
+        
+        if answer_audio:
+            resp.play(answer_audio)
+        else:
+            resp.say(answer, voice="Polly.Joanna-Neural")
         
         if not is_conversation_ending(answer):
             gather = resp.gather(
@@ -198,16 +301,43 @@ CONVERSATION STYLE:
                 speech_timeout="auto",
                 enhanced=True
             )
-            gather.say("Is there anything else I can help you with today?", voice="Polly.Joanna-Neural")
-            resp.say("Thanks for calling! Have a great day!", voice="Polly.Joanna-Neural")
+            
+            followup_text = "Anything else I can help you with?"
+            followup_audio = generate_speech_elevenlabs(followup_text)
+            
+            if followup_audio:
+                gather.play(followup_audio)
+            else:
+                gather.say(followup_text, voice="Polly.Joanna-Neural")
+                
+            closing_text = "Thanks for calling! Have a great day!"
+            closing_audio = generate_speech_elevenlabs(closing_text)
+            
+            if closing_audio:
+                resp.play(closing_audio)
+            else:
+                resp.say(closing_text, voice="Polly.Joanna-Neural")
         else:
-            resp.say("Thanks so much for calling! We'll be in touch soon.", voice="Polly.Joanna-Neural")
+            final_text = "Thanks so much for calling! We'll be in touch soon to schedule your mounting."
+            final_audio = generate_speech_elevenlabs(final_text)
+            
+            if final_audio:
+                resp.play(final_audio)
+            else:
+                resp.say(final_text, voice="Polly.Joanna-Neural")
         
         resp.hangup()
         
     except Exception as e:
         print(f"OpenAI error: {e}")
-        resp.say("No worries, I'm having a little tech hiccup. Let me grab your name and number quickly.", voice="Polly.Joanna-Neural")
+        error_text = "No worries, I'm having a little tech hiccup. Let me grab your name and number quickly."
+        error_audio = generate_speech_elevenlabs(error_text)
+        
+        if error_audio:
+            resp.play(error_audio)
+        else:
+            resp.say(error_text, voice="Polly.Joanna-Neural")
+            
         resp.record(action="/handle-recording", max_length=60, transcribe=True)
     
     return Response(str(resp), mimetype="text/xml")
@@ -223,7 +353,15 @@ def handle_recording():
         print(f"Transcription: {transcription}")
     
     resp = VoiceResponse()
-    resp.say("Perfect, got it! Someone will call you back today. Thanks for calling!", voice="Polly.Joanna-Neural")
+    
+    final_text = "Perfect, got it! Someone will call you back today to schedule your TV mounting. Thanks!"
+    final_audio = generate_speech_elevenlabs(final_text)
+    
+    if final_audio:
+        resp.play(final_audio)
+    else:
+        resp.say(final_text, voice="Polly.Joanna-Neural")
+        
     resp.hangup()
     
     return Response(str(resp), mimetype="text/xml")
@@ -236,12 +374,13 @@ def handle_recording():
 def is_conversation_ending(response):
     ending_phrases = [
         "thanks for calling",
-        "have a great day",
+        "have a great day", 
         "we'll be in touch",
         "someone will call you",
         "talk to you soon",
         "goodbye",
-        "we'll contact you"
+        "we'll contact you",
+        "schedule your mounting"
     ]
     return any(phrase in response.lower() for phrase in ending_phrases)
 
@@ -252,14 +391,16 @@ def is_conversation_ending(response):
 
 @app.route("/")
 def home():
-    return "Twilio AI Receptionist is running! 📞", 200
+    return "TV Mounting AI Receptionist is running! 📺📞", 200
 
 @app.route("/health")
 def health():
     return {
         "status": "healthy",
         "openai_key": "set" if os.getenv("OPENAI_API_KEY") else "missing",
-        "twilio_configured": "yes" if os.getenv("TWILIO_ACCOUNT_SID") else "no"
+        "elevenlabs_key": "set" if os.getenv("ELEVENLABS_API_KEY") else "missing", 
+        "twilio_configured": "yes" if os.getenv("TWILIO_ACCOUNT_SID") else "no",
+        "scheduled_days": scheduled_days
     }, 200
 
 @app.before_request
