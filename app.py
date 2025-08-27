@@ -1,9 +1,9 @@
 from flask import Flask, request, Response, send_file
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client
-import os
 from openai import OpenAI
-from elevenlabs import generate, set_api_key
+from elevenlabs import ElevenLabs
+import os
 import tempfile
 import uuid
 import time
@@ -14,7 +14,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # ----------------------
 
-# Environment API keys (never hardcode in production)
+# Environment API keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -22,11 +22,9 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 YOUR_PHONE_NUMBER = "+13234576314"  # Google Voice
 
-# Initialize OpenAI and ElevenLabs
+# Initialize clients
 client = OpenAI(api_key=OPENAI_API_KEY)
-set_api_key(ELEVENLABS_API_KEY)
-
-# Twilio client
+eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Store temporary audio
@@ -45,24 +43,18 @@ AI_ENABLED = True
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "https://twilio-ai-receptionist.onrender.com")
 
 # Pricing info
-PRICING_INFO = """<PASTE YOUR PRICING INFO HERE>"""  # Keep as you had it
-
+PRICING_INFO = """<PASTE YOUR PRICING INFO HERE>"""  # Keep your existing pricing text
 
 # ----------------------
 # ELEVENLABS HELPER
 # ----------------------
+
 def generate_speech_elevenlabs(text: str) -> str | None:
     try:
-        audio = generate(
+        audio = eleven_client.text_to_speech(
             text=text,
             voice="yM93hbw8Qtvdma2wCnJG",
-            model="eleven_multilingual_v2",
-            voice_settings={
-                "stability": 0.5,
-                "similarity_boost": 0.8,
-                "style": 0.2,
-                "use_speaker_boost": True
-            }
+            model="eleven_multilingual_v2"
         )
         audio_id = str(uuid.uuid4())
         temp_audio_files[audio_id] = {"data": audio, "timestamp": time.time()}
@@ -75,7 +67,6 @@ def cleanup_old_audio():
     now = time.time()
     to_remove = [k for k,v in temp_audio_files.items() if now - v['timestamp'] > 600]
     for k in to_remove: del temp_audio_files[k]
-
 
 @app.route("/audio/<audio_id>.mp3")
 def serve_audio(audio_id):
@@ -92,6 +83,7 @@ def serve_audio(audio_id):
 # ----------------------
 # ROUTES
 # ----------------------
+
 @app.route("/voice", methods=["POST"])
 def voice():
     resp = VoiceResponse()
@@ -218,3 +210,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT",5000))
     app.run(host="0.0.0.0", port=port)
+
