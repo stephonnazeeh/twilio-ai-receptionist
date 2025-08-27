@@ -1,58 +1,88 @@
 import os
 import uuid
 import tempfile
+import time
+import requests
 from flask import Flask, request, Response, send_file
-from twilio.twiml.voice_response import VoiceResponse, Gather
-from openai import OpenAI
-from elevenlabs import set_api_key, generate
+from twilio.twiml.voice_response import VoiceResponse
 
 app = Flask(__name__)
 
 # ----------------------
 # CONFIG
 # ----------------------
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-set_api_key(os.getenv("ELEVENLABS_API_KEY"))
 
-YOUR_PHONE_NUMBER = "+13234576314"  # Google Voice
-AI_ENABLED = True
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+YOUR_PHONE_NUMBER = "+13234576314"  # Your Google Voice number
 
+# Temporary audio storage
 temp_audio_files = {}
 
 # ----------------------
-# ELEVENLABS HELPER
+# ElevenLabs via HTTP
 # ----------------------
-def generate_speech(text):
-    """Generate speech with ElevenLabs and store temporarily"""
+
+def generate_speech_elevenlabs(text):
+    """Generate speech using ElevenLabs HTTP API and return URL for playback"""
     try:
-        audio_bytes = generate(
-            text=text,
-            voice="Rachel",
-            model="eleven_multilingual_v2"
-        )
+        url = "https://api.elevenlabs.io/v1/text-to-speech/yM93hbw8Qtvdma2wCnJG"
+        headers = {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "text": text,
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.8,
+                "style": 0.2
+            }
+        }
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        audio_bytes = response.content
+
+        # Save temporarily
         audio_id = str(uuid.uuid4())
-        temp_audio_files[audio_id] = audio_bytes
+        temp_audio_files[audio_id] = {
+            "data": audio_bytes,
+            "timestamp": time.time()
+        }
+
         base_url = os.getenv("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")
         return f"{base_url}/audio/{audio_id}.mp3"
+
     except Exception as e:
         print("ElevenLabs error:", e)
         return None
 
+def cleanup_old_audio():
+    """Remove old audio files > 10 min"""
+    now = time.time()
+    to_delete = [k for k, v in temp_audio_files.items() if now - v["timestamp"] > 600]
+    for k in to_delete:
+        del temp_audio_files[k]
+
 @app.route("/audio/<audio_id>.mp3")
 def serve_audio(audio_id):
+    cleanup_old_audio()
     if audio_id not in temp_audio_files:
         return "Audio not found", 404
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    temp_file.write(temp_audio_files[audio_id])
-    temp_file.close()
-    return send_file(temp_file.name, mimetype="audio/mpeg")
+
+    data = temp_audio_files[audio_id]["data"]
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tmp.write(data)
+    tmp.close()
+    return send_file(tmp.name, mimetype="audio/mpeg", as_attachment=False)
 
 # ----------------------
-# ROUTES
+# Twilio Call Routes
 # ----------------------
+
 @app.route("/voice", methods=["POST"])
 def voice():
-    """Forward call to your number for 6s, then AI pickup"""
     resp = VoiceResponse()
     dial = resp.dial(timeout=6, action="/ai-pickup", method="POST")
     dial.number(YOUR_PHONE_NUMBER)
@@ -60,22 +90,14 @@ def voice():
 
 @app.route("/ai-pickup", methods=["POST"])
 def ai_pickup():
-    """AI answers if no human pickup"""
     resp = VoiceResponse()
-    if not AI_ENABLED:
-        resp.say("Sorry, no one is available. Please try again later.", voice="Polly.Joanna-Neural")
-        resp.hangup()
-        return Response(str(resp), mimetype="text/xml")
-
-    greeting = "Thank you for calling Mount Masters, this is Daniel. How can I help you today?"
-    audio_url = generate_speech(greeting)
-
-    gather = resp.gather(input="speech", timeout=5, action="/process", speech_timeout="auto")
+    greeting = "Thank you for calling Mount Masters, this is Daniel, how can I help you today?"
+    audio_url = generate_speech_elevenlabs(greeting)
+    gather = resp.gather(input="speech", timeout=5, action="/process", speech_timeout="auto", enhanced=True)
     if audio_url:
         gather.play(audio_url)
     else:
-        gather.say(greeting, voice="Polly.Matthew-Neural")
-
+        gather.say(greeting)
     resp.record(play_beep=False, recording_status_callback="/handle-recording")
     resp.hangup()
     return Response(str(resp), mimetype="text/xml")
@@ -84,15 +106,11 @@ def ai_pickup():
 def process():
     transcription = request.form.get("SpeechResult", "")
     resp = VoiceResponse()
-    if transcription:
-        answer = f"You said: {transcription}. We'll call you shortly."
+    if not transcription:
+        resp.say("Sorry, I couldn't hear you.")
     else:
-        answer = "Sorry, I didn't catch that. Please call again later."
-    audio_url = generate_speech(answer)
-    if audio_url:
-        resp.play(audio_url)
-    else:
-        resp.say(answer, voice="Polly.Matthew-Neural")
+        # Here you could add OpenAI processing
+        resp.say(f"You said: {transcription}")
     resp.hangup()
     return Response(str(resp), mimetype="text/xml")
 
@@ -101,14 +119,20 @@ def handle_recording():
     recording_url = request.form.get("RecordingUrl")
     print("Recording saved:", recording_url)
     resp = VoiceResponse()
-    resp.say("Thank you! We received your message.", voice="Polly.Matthew-Neural")
+    resp.say("Thanks! Someone will call you back shortly.")
     resp.hangup()
     return Response(str(resp), mimetype="text/xml")
 
-@app.route("/")
-def home():
-    return "AI Receptionist Running! ✅", 200
+# ----------------------
+# Health Check
+# ----------------------
+@app.route("/health")
+def health():
+    return {"status": "healthy"}, 200
 
+# ----------------------
+# Run
+# ----------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
