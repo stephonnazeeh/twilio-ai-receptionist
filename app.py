@@ -1,29 +1,28 @@
 import os
 import tempfile
-import requests
 from flask import Flask, request, send_file
 from twilio.twiml.voice_response import VoiceResponse
 from openai import OpenAI
-from elevenlabs import ElevenLabs
+from elevenlabs import generate, set_api_key
 
 app = Flask(__name__)
 
 # --- Load API keys ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-
-# Your ElevenLabs voice ID
 VOICE_ID = "dXHKnmELyDS5HzlpW0VN"
+
+# init clients
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+set_api_key(ELEVENLABS_API_KEY)
+
 
 @app.route("/voice", methods=["POST"])
 def voice():
     """Handles incoming Twilio calls"""
     incoming_msg = request.values.get("SpeechResult", "Hello")
-    
-    # Step 1: Get AI response from OpenAI
+
+    # Step 1: OpenAI generates receptionist response
     response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -32,29 +31,32 @@ def voice():
         ]
     )
     ai_text = response.choices[0].message.content
-    
-    # Step 2: Get ElevenLabs audio
-    audio = eleven_client.text_to_speech.convert(
-        voice_id=VOICE_ID,
-        model_id="eleven_monolingual_v1",
-        text=ai_text
+
+    # Step 2: ElevenLabs generates audio
+    audio = generate(
+        text=ai_text,
+        voice=VOICE_ID,
+        model="eleven_monolingual_v1"
     )
 
-    # Save to temp file
+    # Save audio to temporary file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
         f.write(audio)
-        audio_url = request.url_root + "play_audio?file=" + f.name
-    
-    # Step 3: Build Twilio response
+        temp_path = f.name
+        audio_url = request.url_root + "play_audio?file=" + temp_path
+
+    # Step 3: Tell Twilio to play the audio
     resp = VoiceResponse()
     resp.play(audio_url)
     return str(resp)
 
+
 @app.route("/play_audio")
 def play_audio():
-    """Serves generated ElevenLabs audio"""
+    """Serves the generated ElevenLabs audio"""
     file = request.args.get("file")
     return send_file(file, mimetype="audio/mpeg")
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
