@@ -2,4 +2,5 @@ Flask
 twilio
 openai
 elevenlabs
+requests
 gunicorn
