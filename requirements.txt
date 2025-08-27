@@ -1,6 +1,6 @@
-Flask
-twilio
-openai
-elevenlabs
-requests
-gunicorn
+Flask==2.3.3
+twilio==8.11.0
+gunicorn==21.2.0
+openai==1.31.0
+elevenlabs==2.11.0
+requests==2.32.0
